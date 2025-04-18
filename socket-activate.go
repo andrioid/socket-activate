@@ -18,6 +18,7 @@ var (
 	destinationAddress = flag.String("a", "127.0.0.1:80", "destination address")
 	timeout            = flag.Duration("t", 0, "inactivity timeout after which to stop the unit again")
 	user               = flag.Bool("user", false, "run as user session")
+	backendTimeout     = flag.Duration("backend-timeout", 30*time.Second, "maximum time to wait for backend connection")
 )
 
 type unitController struct {
@@ -93,6 +94,9 @@ func startTCPProxy(activityMonitor chan<- bool) {
 	}
 	defer l.Close()
 
+	var hadSuccessfulConnection bool
+	startTime := time.Now()
+
 	for {
 		activityMonitor <- true
 		connOutwards, err := l.Accept()
@@ -102,20 +106,40 @@ func startTCPProxy(activityMonitor chan<- bool) {
 		}
 
 		var connBackend net.Conn
-		tryCount := 0
-		for tryCount < 10 {
+		attempt := 0
+		maxRetries := 10
+
+		for {
 			connBackend, err = net.Dial("tcp", *destinationAddress)
-			if err != nil {
-				fmt.Println(err)
-				time.Sleep(100 * time.Millisecond)
-				continue
-			} else {
-				break
+			if err == nil {
+				break // Successfully connected
 			}
+
+			// If we had a successful connection before and now can't connect, exit
+			if hadSuccessfulConnection {
+				fmt.Println("Backend connection failed after previous success, exiting")
+				os.Exit(0)
+			}
+
+			// Check if we've exceeded the backend timeout
+			if time.Since(startTime) > *backendTimeout {
+				fmt.Printf("Backend connection attempts exceeded timeout of %v, exiting\n", *backendTimeout)
+				os.Exit(0)
+			}
+
+			attempt++
+			if attempt >= maxRetries {
+				attempt = maxRetries - 1 // Cap the delay at max retry level
+			}
+
+			// Calculate delay using exponential backoff
+			delay := time.Duration(500*(1<<attempt)) * time.Millisecond
+			fmt.Printf("Connection attempt failed, retrying in %v: %v\n", delay, err)
+			time.Sleep(delay)
 		}
-		if tryCount >= 10 {
-			continue
-		}
+
+		// Mark that we've had at least one successful connection
+		hadSuccessfulConnection = true
 
 		go proxyNetworkConnections(connOutwards, connBackend, activityMonitor)
 		go proxyNetworkConnections(connBackend, connOutwards, activityMonitor)
@@ -125,22 +149,20 @@ func startTCPProxy(activityMonitor chan<- bool) {
 func main() {
 
 	flag.Parse()
-
-	if os.Getenv("LISTEN_PID") == strconv.Itoa(os.Getpid()) {
-
-		unitCtrl := newUnitController(*targetUnit)
-
-		activityMonitor := make(chan bool)
-		if *timeout != 0 {
-			go unitCtrl.terminateWithoutActivity(activityMonitor)
-		}
-
-		// first, connect to systemd for starting the unit
-		unitCtrl.startSystemdUnit()
-
-		// then take over the socket from systemd
-		startTCPProxy(activityMonitor)
-	} else {
-		log.Fatal("seems not to be systemd-activated, aborting")
+	if os.Getenv("LISTEN_PID") != strconv.Itoa(os.Getpid()) {
+		log.Fatal("socket-activate is only meant to be run from a systemd unit, aborting.")
 	}
+
+	unitCtrl := newUnitController(*targetUnit)
+
+	activityMonitor := make(chan bool)
+	if *timeout != 0 {
+		go unitCtrl.terminateWithoutActivity(activityMonitor)
+	}
+
+	// first, connect to systemd for starting the unit
+	unitCtrl.startSystemdUnit()
+
+	// then take over the socket from systemd
+	startTCPProxy(activityMonitor)
 }
