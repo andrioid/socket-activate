@@ -17,6 +17,7 @@ var (
 	targetUnit         = flag.String("u", "null.service", "corresponding unit")
 	destinationAddress = flag.String("a", "127.0.0.1:80", "destination address")
 	timeout            = flag.Duration("t", 0, "inactivity timeout after which to stop the unit again")
+	user               = flag.Bool("u", false, "run as user")
 )
 
 type unitController struct {
@@ -25,6 +26,15 @@ type unitController struct {
 }
 
 func newUnitController(name string) unitController {
+	// Connect to SystemBus if user is false, otherwise connect to SessionBus
+	if *user {
+		conn, err := dbus.SessionBus()
+		if err != nil {
+			log.Fatal(err)
+		}
+		return unitController{conn, name}
+	}
+	// Connect to SystemBus
 	conn, err := dbus.SystemBus()
 	if err != nil {
 		log.Fatal(err)
